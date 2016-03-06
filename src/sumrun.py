@@ -1,0 +1,362 @@
+from pprint import pprint,pformat
+import re
+from numpy import int_
+from collections import defaultdict
+
+def read_asm(f):
+    """
+    yields (label, op_name, [args])
+    """
+    for line in f:
+        print(line)
+        line = line.strip()
+        if line.startswith("#"):
+            continue
+        if "<" in line:
+            line, commentary = line.rsplit(" <", 1)
+        lno, rest = line.split(":", 1)
+        if re.match("^[0-9a-fA-F]+$", rest.strip()):
+            continue
+        op, args = rest.split()[-2:]
+        argvs = [s.strip() for s in re.split(",(?![^(]*\))", args)]
+        yield (lno.strip(), op.strip(), argvs)
+
+class Expr:
+    def __add__(self, other):
+        if not isinstance(other, Expr) and other == 0:
+            return self
+        return OpExpr("add", self, other)
+
+    def __radd__(self, other):
+        if not isinstance(other, Expr) and other == 0:
+            return self
+        return OpExpr("add", other, self)
+
+    def __sub__(self, other):
+        return OpExpr("sub", self, other)
+
+    def __rsub__(self, other):
+        return OpExpr("sub", other, self)
+
+    def __xor__(self, other):
+        if self == other:
+            return int_(0)
+        else:
+            return OpExpr("xor", self, other)
+
+    def __mul__(self, other):
+        return OpExpr("mul", self, other)
+
+    def __lshift__(self, other):
+        return OpExpr("shl", self, other)
+        
+    def __rshift__(self, other):
+        return OpExpr("shr", self, other)
+
+    def __or__(self, other):
+        return OpExpr("or", self, other)
+
+    def __and__(self, other):
+        return OpExpr("and", self, other)
+
+    def __eq__(self, other):
+        return OpExpr("eq", self, other)
+
+class CPUJump(Exception):
+    pass
+        
+class CPUSymbolicJump(Exception):
+    pass
+        
+
+class OpExpr(Expr):
+    def __init__(self, op, *args):
+        self.op = op
+        self.args = args
+
+    def __repr__(self):
+        return str(self)
+
+    def __str__(self):
+        return "("+self.op+" "+",".join(str(s) for s in self.args)+")"
+
+    def __hash__(self):
+        return hash(self.op) + sum(hash(a) for a in self.args)
+
+    def __eq__(self, other):
+        if isinstance(other, OpExpr):
+            if self.op == other.op and all(s==o for s,o in zip(self.args, other.args)):
+                return True
+        return super().__eq__(other)
+
+class Symbol(Expr):
+    table = set()
+    def __init__(self, name):
+        self.name = name
+        Symbol.table.add(self)
+
+    def __repr__(self):
+        return "<"+self.name+">"
+
+    def __str__(self):
+        return self.name
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        if isinstance(other, Symbol):
+            if self.name == other.name:
+                return True
+        return super().__eq__(other)
+
+
+class SymbolicDefaultDict(defaultdict):
+    def __init__(self, prefix):
+        self.prefix = str(prefix)
+    def __missing__(self, key):
+        val = Symbol(self.prefix+str(key))
+        self[key] = val
+        return val
+
+class NameSpaceImmediate:
+    def __getitem__(self, key):
+        return key
+
+class x86RegisterFile:
+    def __init__(self, stackptr, magic=[]):
+        self.regs = {}
+        self.regs["zero"] = int_(0)
+        self.regs["rsp"] = stackptr
+
+        for r in ["rbp","rsi","rdi"]:
+            self.regs[r] = Symbol("reg_"+r)
+
+        for r in ["rax","rbx","rcx","rdx"]:
+            self.regs[r] = Symbol("reg_"+r)
+
+        for r in range(8,16):
+            self.regs['r'+str(r)] = Symbol("reg_"+str(r))
+
+        for m in magic:
+            self.regs[m] = Symbol(m)
+
+    def __getitem__(self, key):
+        print(self.regs)
+        print(key)
+        if key in self.regs:
+            return self.regs[key]
+        elif key.startswith("e"):
+            key = 'r'+key[1:]
+            return self.regs[key] & 0xFFFFFFFF
+        elif key.endswith("d"):
+            return self.regs[key[:-1]] & 0xFFFFFFFF
+        else:
+            raise KeyError("What register are you looking for!? "+str(key))
+
+    def __setitem__(self, key, value):
+        if key in self.regs:
+            self.regs[key] = value
+        elif key.startswith("e"):
+            key = 'r'+key[1:]
+            self.regs[key] = value & 0xFFFFFFFF
+        elif key.endswith("d"):
+            self.regs[key[:-1]] = value & 0xFFFFFFFF
+        else:
+            raise KeyError("What register are you looking for!? "+str(key))
+            
+
+    def __repr__(self):
+        ret = "Register File:\n"
+        ret += pformat(self.regs)
+        return ret
+        
+
+class CPU:
+    def __init__(self, code, single_step=True):
+        self.code = list(code)
+        self.label_index = {stmt[0]:i for i,stmt in enumerate(self.code)}
+        self.step = single_step
+        self.memory    = SymbolicDefaultDict("mem_")
+        self.register  = x86RegisterFile(0x1000000, ["magic"+str(i) for i in range(9)])
+        self.immediate = NameSpaceImmediate()
+        self.flags     = SymbolicDefaultDict("flag_")
+
+        self.pc = 0
+        
+    def run(self):
+        end = len(self.code)
+        while self.pc < end:
+            #print("#"*60)
+            #print("#"*60)
+            #print("#"*60)
+            #print("#"*60)
+            pprint(self.code[self.pc])
+            label, op, args = self.code[self.pc]
+            self.pc += 1
+            try:
+                self.__getattribute__("op_"+op)(*args)
+                if self.step:
+                    print("#"*70)
+                    print("#"*70)
+                    pprint(self.memory)
+                    pprint(self.register)
+                    pprint(self.code[self.pc-1])
+                    #input("press any key for the next step")
+                #pprint(Symbol.table)
+                #pprint(self.register)
+            except CPUJump as e:
+                self.pc = self.label_index[e.args[0]]
+            except AttributeError as e:
+                raise NotImplementedError(e)
+
+    def _eval_operand(self, op):
+        if op.startswith("%"):
+            return self.register[op[1:]]
+        elif op.startswith("$"):
+            return int_(int(op[1:], 16))
+        elif op.startswith("0x"):
+            return int_(int(op, 16))
+        else:
+            try:
+                return int_(op)
+            except ValueError as e:
+                raise NotImplementedError("wtf operand? "+op)
+
+    def _eval_reference(self, op):
+        if op.startswith("%"):
+            return (self.register, op[1:])
+        elif op.startswith("$"):
+            return (self.immediate, int_(int(op[1:], 16)))
+        else:
+            return (self.memory, self._parse_mem_ref(op))
+
+    def _parse_mem_ref(self, ref):
+        # disp(base,index,scale)  == [base+index*scale+disp]
+        m = re.match(r"""(?P<disp>-?0x[0-9a-fA-F]+)?
+                        \(
+                        (?P<base>%[a-z0-9]+)
+                        (?:,(?P<index>%[a-z0-9]+))?
+                        (?:,(?P<scale>(?:0x)?[0-9a-fA-F]+))?
+                        \)""", ref, re.VERBOSE)
+        if m:
+            fields = [("disp", "0x0"),
+                        ("base", "%zero"),
+                        ("index", "%zero"),
+                        ("scale", "0x0")]
+            vals = []
+            for name,default in fields:
+                match = m.groupdict()[name]
+                if match is None:
+                    print("defaulting: {} = {}".format(name,default))
+                    match = default
+                else:
+                    print("given: {} = {}".format(name, match))
+                vals.append(self._eval_operand(match))
+            disp,base,index,scale = vals
+
+            return base+index*scale+disp
+        else:
+            raise ValueError("Not a valid memory adress: "+ref)
+
+    def op_movl(self, fro, to):
+        """TODO: This might be invalid semantics, memory in fro allowed?
+        """
+        nsf,val = self._eval_reference(fro)
+        nst,index = self._eval_reference(to)
+        nst[index] = nsf[val]
+
+    def op_xor(self, fro, to):
+        f = self._eval_operand(fro)
+        reg,t = self._eval_reference(to)
+        reg[t] = reg[t]^f
+
+    def op_mov(self, fro, to):
+        nsf,f = self._eval_reference(fro)
+        nst,t = self._eval_reference(to)
+        print(nsf,f)
+        print(nst,t)
+        nst[t] = nsf[f]
+        
+    def op_shl(self, a, b):
+        a = self._eval_operand(a)
+        nsb,b = self._eval_reference(b)
+        nsb[b] = nsb[b]<<a
+
+    def op_shr(self, a, b):
+        a = self._eval_operand(a)
+        nsb,b = self._eval_reference(b)
+        nsb[b] = nsb[b]>>a
+
+    def op_or(self, a, b):
+        a = self._eval_operand(a)
+        nsb,b = self._eval_reference(b)
+        nsb[b] = nsb[b] | a
+
+    def op_and(self, a, b):
+        a = self._eval_operand(a)
+        nsb,b = self._eval_reference(b)
+        nsb[b] = nsb[b] & a
+
+    def op_lea(self, a, b):
+        mem,a = self._eval_reference(a)
+        reg,b = self._eval_reference(b)
+        reg[b] = a
+
+    def op_add(self, a, b):
+        a = self._eval_operand(a)
+        nsb,b = self._eval_reference(b)
+        nsb[b] = nsb[b] + a
+        
+    def op_sub(self, a, b):
+        a = self._eval_operand(a)
+        nsb,b = self._eval_reference(b)
+        nsb[b] = nsb[b] - a
+
+    def op_cmp(self, a, b):
+        a = self._eval_operand(a)
+        b = self._eval_operand(b)
+        
+        self.flags["SF"] = None # MSB of a-b (sign flag)
+        self.flags["ZF"] = ((a-b)==int_(0))      # (zero flag)
+        self.flags["CF"] = int_(0)               # (carry flag)
+        # flags OF                               # (overflow flag)
+        # flags PF                               # (parity flag)
+
+    def op_cmpl(self, a, b):
+        """TODO: this might have different mem/reg reference semantics!"""
+        a = self._eval_operand(a)
+        nsp,b = self._eval_reference(b)
+        b = nsp[b]
+        
+        self.flags["SF"] = None # MSB of a-b (sign flag)
+        self.flags["ZF"] = ((a-b)==int_(0))      # (zero flag)
+        self.flags["CF"] = int_(0)               # (carry flag)
+        # flags OF                               # (overflow flag)
+        # flags PF                               # (parity flag)
+
+
+    def op_jne(self, label):
+        if isinstance(self.flags["ZF"], Expr):
+            raise CPUSymbolicJump(self.flags["ZF"])
+        if not self.flags["ZF"]:
+            raise CPUJump(label)
+    
+    def op_push(self, a):
+        a = self._eval_operand(a)
+        self.register["rsp"] = self.register["rsp"]-8
+        self.memory[self.register["rsp"]] = a
+
+
+def main(self, infile, *argv):
+    with open(infile) as f:
+        cpu = CPU(read_asm(f))
+            
+    pprint(cpu.code)
+    pprint(cpu.label_index)
+
+    cpu.run()
+
+if __name__=='__main__':
+    import sys
+    main(*sys.argv)
