@@ -463,14 +463,14 @@ class CPU:
         self.memory[self.register["rsp"]] = a
 
 
-def main(self, infile, resultprefix="state", *argv):
+def main(self, infile, resultprefix="state", display="hso", *argv):
     with open(infile) as f:
         cpu = CPU(read_asm(f))
             
     pprint(cpu.code)
     pprint(cpu.label_index)
 
-    cpu.run()
+    cpu.run(output=display)
     cpu.save_state(resultprefix)
 
 if __name__=='__main__':
