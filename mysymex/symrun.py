@@ -313,20 +313,20 @@ MemOp = MemOpSpec("MemOp")
 
 class ImmOpSpec(OperandSpec):
     def evaluate(self, operand, cpu):
-        if op.startswith("$"):
-            return OperandWrapper(cpu.immediate, parse_int(op[1:]), writable=False)
+        if operand.startswith("$"):
+            return OperandWrapper(cpu.immediate, parse_int(operand[1:]), writable=False)
         try:
-            return OperandWrapper(cpu.immediate, parse_int(op), writable=False)
+            return OperandWrapper(cpu.immediate, parse_int(operand), writable=False)
         except ValueError as e:
-            raise ValueError("Not a valid immediate: "+op)
+            raise ValueError("Not a valid immediate: "+operand)
 ImmOp = ImmOpSpec("ImmOp")
 
 class RegOpSpec(OperandSpec):
     def evaluate(self, operand, cpu):
-        if op.startswith("%"):
-            return OperandWrapper(cpu.register, op[1:])
+        if operand.startswith("%"):
+            return OperandWrapper(cpu.register, operand[1:])
         else:
-            raise ValueError("Not a register")
+            raise ValueError("Not a register: "+operand)
 RegOp = RegOpSpec("RegOp")
 
 class LabelOpSpec(OperandSpec):
@@ -342,13 +342,13 @@ class OperandWrapper:
 
     @property
     def value(self):
-        return self.ns[key]
+        return self.ns[self.key]
 
     @value.setter
     def value(self, newval):
         if not self.writable:
             raise TypeError("This operand is not writable: "+key)
-        self.ns[key] = newval
+        self.ns[self.key] = newval
 
 class CPU:
     def __init__(self, code):
@@ -541,10 +541,9 @@ class CPU:
         reg,b = self._eval_reference(b)
         reg[b] = a
 
+    @Operands(RegOp|ImmOp, RegOp)
     def op_add(self, a, b):
-        a = self._eval_operand(a)
-        nsb,b = self._eval_reference(b)
-        nsb[b] = nsb[b] + a
+        b.value = b.value + a.value
         
     def op_sub(self, a, b):
         a = self._eval_operand(a)
