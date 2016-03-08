@@ -1,7 +1,8 @@
 from pprint import pprint,pformat
 import re
 from numpy import int_, bool_
-from collections import defaultdict
+from collections import defaultdict,ChainMap
+from functools import wraps
 import json
 import pickle
 import yaml
@@ -82,6 +83,12 @@ class CPUJump(Exception):
 class CPUSymbolicJump(Exception):
     pass
         
+
+def parse_int(i):
+    try:
+        return int_(int(i))
+    except ValueError as e:
+        return int_(int(i, 16))
 
 class OpExpr(Expr):
     def __init__(self, op, *args):
@@ -226,6 +233,122 @@ class x86RegisterFile:
         ret += pformat(self.regs)
         return ret
         
+class Operands:
+    """
+    This is a decorator for specifying operand types
+    use like:
+
+    @Operands(MemOp|RegOp|ImmOp, MemOp|RegOp)
+    def op_mov(self, a, b):
+        b.value = a.value
+
+    the parameters will be passed as OperandWrapper
+    """
+    def __init__(self, *specs):
+        self.specs = specs
+    def __call__(self, f):
+        @wraps(f)
+        def wrapper(cpu, *operands):
+            args = (spec.parse(arg, cpu)
+                    for spec,arg in zip(self.specs, operands))
+            return f(cpu, *args)
+        return wrapper
+
+
+class OperandSpec:
+    def __init__(self, name="", order=None):
+        self.name = name
+        if order is None:
+            self.eval_order = [self]
+        else:
+            self.eval_order = order
+
+    def __or__(self, other):
+        return OperandSpec(order=(self.eval_order + other.eval_order))
+
+    def __str__(self):
+        return "|".join(s.name for s in self.eval_order)
+
+    def parse(self, operand, cpu):
+        for spec in self.eval_order:
+            try:
+                return spec.evaluate(operand, cpu)
+            except ValueError as e:
+                continue
+
+        msg = "Could not parse {} according to {}".format(operand, self)
+        raise ValueError(msg)
+
+class MemOpSpec(OperandSpec):
+    def evaluate(self, operand, cpu):
+        # disp(base,index,scale)  == [base+index*scale+disp]
+        match = re.match(r"""(?P<disp>-?0x[0-9a-fA-F]+)?
+                             \(
+                                 (?P<base>%[a-z0-9]+)
+                                 (?:,(?P<index>%[a-z0-9]+))?
+                                 (?:,(?P<scale>(?:0x)?[0-9a-fA-F]+))?
+                             \)""", operand, re.VERBOSE)
+        if not match:
+            raise ValueError("Not a valid memory adress: "+operand)
+
+        defaults = {
+            "disp" : "0x0",
+            "base" : "%zero",
+            "index": "%zero",
+            "scale": "0x0"
+        }
+
+        fields = ChainMap(
+            {k:v for k,v in match.groupdict().items() if v is not None},
+            defaults
+        )
+
+        disp  = parse_int(fields["disp"])
+        base  = RegOp.evaluate(fields["base"], cpu).value
+        index = RegOp.evaluate(fields["index"], cpu).value
+        scale = parse_int(fields["scale"])
+
+        return OperandWrapper(cpu.memory, base+index*scale+disp)
+MemOp = MemOpSpec("MemOp")
+
+class ImmOpSpec(OperandSpec):
+    def evaluate(self, operand, cpu):
+        if op.startswith("$"):
+            return OperandWrapper(cpu.immediate, parse_int(op[1:]), writable=False)
+        try:
+            return OperandWrapper(cpu.immediate, parse_int(op), writable=False)
+        except ValueError as e:
+            raise ValueError("Not a valid immediate: "+op)
+ImmOp = ImmOpSpec("ImmOp")
+
+class RegOpSpec(OperandSpec):
+    def evaluate(self, operand, cpu):
+        if op.startswith("%"):
+            return OperandWrapper(cpu.register, op[1:])
+        else:
+            raise ValueError("Not a register")
+RegOp = RegOpSpec("RegOp")
+
+class LabelOpSpec(OperandSpec):
+    def evaluate(self, operand, cpu):
+        return OperandWrapper(cpu.label_index, operand, writable=False)
+LabelOp = LabelOpSpec("LabelOp")
+
+class OperandWrapper:
+    def __init__(self, namespace, key, writable=True):
+        self.ns       = namespace
+        self.key      = key
+        self.writable = writable
+
+    @property
+    def value(self):
+        return self.ns[key]
+
+    @value.setter
+    def value(self, newval):
+        if not self.writable:
+            raise TypeError("This operand is not writable: "+key)
+        self.ns[key] = newval
 
 class CPU:
     def __init__(self, code):
