@@ -4,6 +4,7 @@
 import unittest
 import os
 import os.path
+import tempfile
 import symrun
 
 class TestAssembly(unittest.TestCase):
@@ -11,7 +12,8 @@ class TestAssembly(unittest.TestCase):
         """
         This is run before each and every test_* function
         """
-        self.ofile_prefix = "./test/state_unholy"
+        self.tmpdir = tempfile.mkdtemp()
+        self.ofile_prefix = os.path.join(self.tmpdir, "state_unholy")
 
     def test_unholy(self):
         """
@@ -28,6 +30,7 @@ class TestAssembly(unittest.TestCase):
         """
         os.remove(self.ofile_prefix+".pickle")
         os.remove(self.ofile_prefix+".yaml")
+        os.rmdir(self.tmpdir)
 
 
 
