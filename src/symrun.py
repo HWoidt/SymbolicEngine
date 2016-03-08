@@ -1,7 +1,10 @@
 from pprint import pprint,pformat
 import re
-from numpy import int_
+from numpy import int_, bool_
 from collections import defaultdict
+import json
+import pickle
+import yaml
 
 def read_asm(f):
     """
@@ -33,9 +36,13 @@ class Expr:
         return OpExpr("add", other, self)
 
     def __sub__(self, other):
+        if not isinstance(other, Expr) and other == 0:
+            return self
         return OpExpr("sub", self, other)
 
     def __rsub__(self, other):
+        if not isinstance(other, Expr) and other == 0:
+            return self
         return OpExpr("sub", other, self)
 
     def __xor__(self, other):
@@ -45,6 +52,8 @@ class Expr:
             return OpExpr("xor", self, other)
 
     def __mul__(self, other):
+        if not isinstance(other, Expr) and other == 1:
+            return self
         return OpExpr("mul", self, other)
 
     def __lshift__(self, other):
@@ -57,11 +66,16 @@ class Expr:
         return OpExpr("or", self, other)
 
     def __and__(self, other):
+        try:
+            if self.op == "and" and not isinstance(other, Expr) and other in self.args:
+                return self
+        except AttributeError as e:
+            pass
         return OpExpr("and", self, other)
 
     def __eq__(self, other):
         return OpExpr("eq", self, other)
-
+    
 class CPUJump(Exception):
     pass
         
@@ -73,15 +87,47 @@ class OpExpr(Expr):
     def __init__(self, op, *args):
         self.op = op
         self.args = args
+        try:
+            self.depth = max(a.depth for a in args if isinstance(a, Expr))+1
+            self.nodes = sum(a.nodes for a in args if isinstance(a, Expr))+1
+        except ValueError as e:
+            self.depth = 1
+            self.nodes = 1
 
     def __repr__(self):
         return str(self)
 
     def __str__(self):
-        return "("+self.op+" "+",".join(str(s) for s in self.args)+")"
+        return "({} -> {})".format(
+            self.op,
+            ",".join(str(s) for s in self.args)
+        )
+
+    def str_build(self):
+        yield "("
+        yield self.op
+        yield " -> "
+        for a in self.args:
+            try:
+                yield from a.str_build()
+            except AttributeError:
+                yield str(a)
+        yield ")"
+
+    def __iter__(self):
+        yield self
+        for a in self.args:
+            try:
+                yield from a
+            except TypeError as e:
+                yield a
 
     def __hash__(self):
-        return hash(self.op) + sum(hash(a) for a in self.args)
+        try:
+            return self.hash
+        except AttributeError:
+            self.hash = hash(self.op) + sum(hash(a) for a in self.args)
+            return self.hash
 
     def __eq__(self, other):
         if isinstance(other, OpExpr):
@@ -89,10 +135,15 @@ class OpExpr(Expr):
                 return True
         return super().__eq__(other)
 
+    def __bool__(self):
+        return False
+
 class Symbol(Expr):
     table = set()
     def __init__(self, name):
         self.name = name
+        self.depth = 1
+        self.nodes = 1
         Symbol.table.add(self)
 
     def __repr__(self):
@@ -100,6 +151,12 @@ class Symbol(Expr):
 
     def __str__(self):
         return self.name
+
+    def str_build(self):
+        yield self.name
+
+    def __iter__(self):
+        yield self
 
     def __hash__(self):
         return hash(self.name)
@@ -112,7 +169,7 @@ class Symbol(Expr):
 
 
 class SymbolicDefaultDict(defaultdict):
-    def __init__(self, prefix):
+    def __init__(self, prefix=""):
         self.prefix = str(prefix)
     def __missing__(self, key):
         val = Symbol(self.prefix+str(key))
@@ -142,8 +199,6 @@ class x86RegisterFile:
             self.regs[m] = Symbol(m)
 
     def __getitem__(self, key):
-        print(self.regs)
-        print(key)
         if key in self.regs:
             return self.regs[key]
         elif key.startswith("e"):
@@ -173,42 +228,104 @@ class x86RegisterFile:
         
 
 class CPU:
-    def __init__(self, code, single_step=True):
+    def __init__(self, code):
+        magic_regs = ["magic"+str(i) for i in range(9)] + ["key0","key1","key2","key3"]
+
         self.code = list(code)
         self.label_index = {stmt[0]:i for i,stmt in enumerate(self.code)}
-        self.step = single_step
         self.memory    = SymbolicDefaultDict("mem_")
-        self.register  = x86RegisterFile(0x1000000, ["magic"+str(i) for i in range(9)])
+        self.register  = x86RegisterFile(0x1000000, magic_regs)
         self.immediate = NameSpaceImmediate()
         self.flags     = SymbolicDefaultDict("flag_")
 
         self.pc = 0
         
-    def run(self):
+    def _show_syms(self):
+        print("Symbol Table:")
+        pprint(Symbol.table)
+    def _show_regs(self):
+        pprint(self.register)
+    def _show_mem(self):
+        pprint(self.memory)
+    def _show_flags(self):
+        pprint(self.flags)
+    def _show_opcode(self):
+        pprint(self.current_opcode())
+    def _show_header(self):
+        print("#"*70)
+        print("######## pc={} cnt={} #######".format(self.pc, self.cycle_cnt))
+        print("#"*70)
+
+    def current_opcode(self):
+        return self.code[self.pc]
+
+    def run(self, ncycles=None, output="hso"):
+        """
+        output = sequence of characters, specifying output actions during each cycle
+                 see below for the available actions:
+        """
+        output_specifier = {
+            "o" : self._show_opcode,
+            "h" : self._show_header,
+            "s" : self._show_syms,
+            "r" : self._show_regs,
+            "m" : self._show_mem,
+            "f" : self._show_flags,
+            "S" : lambda : input("press enter for next step")
+        }
         end = len(self.code)
+        self.cycle_cnt = 0
         while self.pc < end:
-            #print("#"*60)
-            #print("#"*60)
-            #print("#"*60)
-            #print("#"*60)
-            pprint(self.code[self.pc])
-            label, op, args = self.code[self.pc]
-            self.pc += 1
+            label, op, args = self.current_opcode()
             try:
                 self.__getattribute__("op_"+op)(*args)
-                if self.step:
-                    print("#"*70)
-                    print("#"*70)
-                    pprint(self.memory)
-                    pprint(self.register)
-                    pprint(self.code[self.pc-1])
-                    #input("press any key for the next step")
-                #pprint(Symbol.table)
-                #pprint(self.register)
+                for spec in output:
+                    output_specifier[spec]()
             except CPUJump as e:
                 self.pc = self.label_index[e.args[0]]
             except AttributeError as e:
                 raise NotImplementedError(e)
+            else:
+                self.pc += 1
+            self.cycle_cnt += 1
+            if ncycles is not None and cnt >= ncycles:
+                return
+    
+    @classmethod
+    def yaml_init(cls):
+        def bool_representer(dumper, data):
+            return dumper.represent_scalar("!bool", str(bool(data)))
+        def bool_constructor(loader, node):
+            val = loader.construct_scalar(node)
+            return bool_(val)
+        def int_representer(dumper, data):
+            return dumper.represent_scalar("!int64", str(int(data)))
+        def int_constructor(loader, node):
+            val = loader.construct_scalar(node)
+            return int_(val)
+        yaml.add_representer(bool_, bool_representer)
+        yaml.add_constructor("!bool", bool_constructor)
+        yaml.add_representer(int_, int_representer)
+        yaml.add_constructor("!int64", int_constructor)
+        
+    def save_state(self, ofile):
+        CPU.yaml_init()
+        with open(ofile+".yaml", "w") as f:
+            f.write(yaml.dump(self))
+        with open(ofile+".pickle", "wb") as f:
+            pickle.dump(self, f)
+
+    @classmethod
+    def load_state(cls, ifile):
+        cls.yaml_init()
+        if ifile.endswith("pickle"):
+            with open(ifile, "rb") as f:
+                return pickle.load(f)
+        else:
+            with open(ifile) as f:
+                return yaml.load(f.read())
+
+
 
     def _eval_operand(self, op):
         if op.startswith("%"):
@@ -274,8 +391,6 @@ class CPU:
     def op_mov(self, fro, to):
         nsf,f = self._eval_reference(fro)
         nst,t = self._eval_reference(to)
-        print(nsf,f)
-        print(nst,t)
         nst[t] = nsf[f]
         
     def op_shl(self, a, b):
@@ -348,7 +463,7 @@ class CPU:
         self.memory[self.register["rsp"]] = a
 
 
-def main(self, infile, *argv):
+def main(self, infile, resultprefix="state", *argv):
     with open(infile) as f:
         cpu = CPU(read_asm(f))
             
@@ -356,6 +471,7 @@ def main(self, infile, *argv):
     pprint(cpu.label_index)
 
     cpu.run()
+    cpu.save_state(resultprefix)
 
 if __name__=='__main__':
     import sys
