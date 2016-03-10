@@ -518,7 +518,7 @@ class CPU:
         exprs = self.unique_exprs() # type: OrderedDict
         for e,i in exprs.items():
             if isinstance(e, OpExpr):
-                args = ",".join(str(exprs[a]) for a in e.args)
+                args = e.op + ",".join(str(exprs[a]) for a in e.args)
             elif isinstance(e, Symbol):
                 args = e.name
             else:
