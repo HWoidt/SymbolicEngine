@@ -21,7 +21,7 @@ class TestAssembly(unittest.TestCase):
         """
         cpu = symrun.main("<self>", "./test/test_unholy.asm", self.ofile_prefix, "ho")
 
-        self.assertEqual(cpu.hash_state(), "3395e6353c7220adcfbe0bbdda1f01027c76839d")
+        self.assertEqual(cpu.hash_state(), "e5deb8cb71f3370445133922b87ec2a198b4d1eb")
         self.assertTrue(os.path.isfile(self.ofile_prefix+".pickle"))
         self.assertTrue(os.path.isfile(self.ofile_prefix+".yaml"))
 

@@ -3,7 +3,7 @@ import re
 from numpy import int_, bool_
 from collections import defaultdict,ChainMap,OrderedDict,deque
 from functools import wraps
-from itertools import count
+from itertools import count,chain
 import json
 import pickle
 import yaml
@@ -91,9 +91,13 @@ class Expr:
         """
         visited = set()
         queue = deque()
-        queue.append(e)
+        queue.append(self)
+
+        class Phantom:
+            pass
+
         try:
-            for e in iter(queue.pop, None):
+            for e in iter(queue.pop, Phantom()):
                 if e not in visited:
                     yield e
                     visited.add(e)
@@ -138,14 +142,6 @@ class OpExpr(Expr):
                     sym   = self.symbols,
         )
 
-    def __iter__(self):
-        yield self
-        for a in self.args:
-            try:
-                yield from a
-            except TypeError as e:
-                yield a
-
     def __hash__(self):
         try:
             return self.hash
@@ -176,12 +172,6 @@ class Symbol(Expr):
 
     def __str__(self):
         return self.name
-
-    def str_build(self):
-        yield self.name
-
-    def __iter__(self):
-        yield self
 
     def __hash__(self):
         return hash(self.name)
@@ -504,25 +494,21 @@ class CPU:
         exprs = OrderedDict()
         ids = count()
 
-        def traverse(e):
-            queue = deque()
-            queue.append(e)
+        top_expr = chain(
+            self.flags.items(),
+            self.register,
+            self.memory.items()
+        )
+
+        for k,e in top_expr:
             try:
-                for e in iter(queue.pop, None):
-                    if e not in exprs:
-                        exprs[e] = next(ids)
-                        if isinstance(e, OpExpr):
-                            queue.extend(e.args)
-            except IndexError as e:
-                pass
-
-        for flag,expr in self.flags.items():
-            traverse(expr)
-        for reg,expr in self.register:
-            traverse(expr)
-        for addr,expr in self.memory.items():
-            traverse(expr)
-
+                # all the children including expr itself:
+                for x in e:
+                    if x not in exprs:
+                        exprs[x] = next(ids)
+            except TypeError as exc:
+                if e not in exprs:
+                    exprs[e] = next(ids)
         return exprs
 
     def hash_state(self):
@@ -542,7 +528,6 @@ class CPU:
                 args = str(e)
             h.update("({}->{})".format(i, args).encode())
         return h.hexdigest()
-            
 
     @classmethod
     def load_state(cls, ifile):
