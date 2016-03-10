@@ -46,6 +46,12 @@ class Expr:
             return self
         return OpExpr("sub", other, self)
 
+    def __rxor__(self, other):
+        if self == other:
+            return int_(0)
+        else:
+            return OpExpr("xor", other, self)
+
     def __xor__(self, other):
         if self == other:
             return int_(0)
@@ -68,7 +74,7 @@ class Expr:
 
     def __and__(self, other):
         try:
-            if self.op == "and" and not isinstance(other, Expr) and other in self.args:
+            if self.op == "and" and (not isinstance(other, Expr)) and other in self.args:
                 return self
         except AttributeError as e:
             pass
@@ -101,25 +107,23 @@ class OpExpr(Expr):
             self.depth = 1
             self.nodes = 1
 
+        self.symbols = set()
+        for a in args:
+            try:
+                self.symbols = self.symbols.union(a.symbols)
+            except AttributeError as e:
+                pass
+
     def __repr__(self):
         return str(self)
 
     def __str__(self):
-        return "({} -> {})".format(
-            self.op,
-            ",".join(str(s) for s in self.args)
+        return "(OpExpr {op} depth={depth} depends={sym}".format(
+                    op    = self.op,
+                    depth = self.depth,
+                    nodes = self.nodes,
+                    sym   = self.symbols,
         )
-
-    def str_build(self):
-        yield "("
-        yield self.op
-        yield " -> "
-        for a in self.args:
-            try:
-                yield from a.str_build()
-            except AttributeError:
-                yield str(a)
-        yield ")"
 
     def __iter__(self):
         yield self
@@ -151,6 +155,7 @@ class Symbol(Expr):
         self.name = name
         self.depth = 1
         self.nodes = 1
+        self.symbols = set([self])
         Symbol.table.add(self)
 
     def __repr__(self):
@@ -246,12 +251,25 @@ class Operands:
     """
     def __init__(self, *specs):
         self.specs = specs
+        self.memo = {}
     def __call__(self, f):
         @wraps(f)
         def wrapper(cpu, *operands):
-            args = (spec.parse(arg, cpu)
-                    for spec,arg in zip(self.specs, operands))
-            return f(cpu, *args)
+            operands = tuple(spec.parse(arg, cpu)
+                             for spec,arg
+                             in  zip(self.specs, operands))
+            return f(cpu, *operands)
+
+        @wraps(f)
+        def memo_wrapper(cpu, *operands):
+            try:
+                return f(cpu, *self.memo[operands])
+            except KeyError as e:
+                self.memo[operands] = tuple(spec.parse(arg, cpu)
+                                            for spec,arg
+                                            in  zip(self.specs, operands))
+            return f(cpu, *self.memo[operands])
+
         return wrapper
 
 
@@ -361,6 +379,8 @@ class CPU:
         self.immediate = NameSpaceImmediate()
         self.flags     = SymbolicDefaultDict("flag_")
 
+        self.next_interactive = 0
+        self.cycle_cnt = 0
         self.pc = 0
         
     def _show_syms(self):
@@ -373,11 +393,21 @@ class CPU:
     def _show_flags(self):
         pprint(self.flags)
     def _show_opcode(self):
-        pprint(self.current_opcode())
+        try:
+            pprint(self.current_opcode())
+        except IndexError as e:
+            pprint(())
     def _show_header(self):
         print("#"*70)
         print("######## pc={} cnt={} #######".format(self.pc, self.cycle_cnt))
         print("#"*70)
+    def _interactive(self):
+        if self.next_interactive == self.cycle_cnt:
+            i = input("> ")
+            try:
+                self.next_interactive = self.cycle_cnt + int(i)
+            except ValueError as e:
+                self.next_interactive = self.cycle_cnt + 1
 
     def current_opcode(self):
         return self.code[self.pc]
@@ -394,16 +424,17 @@ class CPU:
             "r" : self._show_regs,
             "m" : self._show_mem,
             "f" : self._show_flags,
-            "S" : lambda : input("press enter for next step")
+            "S" : lambda : input("press enter for next step"),
+            "I" : self._interactive,
         }
         end = len(self.code)
         self.cycle_cnt = 0
         while self.pc < end:
+            for spec in output:
+                output_specifier[spec]()
             label, op, args = self.current_opcode()
             try:
                 self.__getattribute__("op_"+op)(*args)
-                for spec in output:
-                    output_specifier[spec]()
             except CPUJump as e:
                 self.pc = self.label_index[e.args[0]]
             except AttributeError as e:
@@ -411,8 +442,11 @@ class CPU:
             else:
                 self.pc += 1
             self.cycle_cnt += 1
-            if ncycles is not None and cnt >= ncycles:
-                return
+            if ncycles is not None and self.cycle_cnt >= ncycles:
+                break
+        for spec in output:
+            output_specifier[spec]()
+        print("-- sim paused --")
     
     @classmethod
     def yaml_init(cls):
@@ -433,6 +467,9 @@ class CPU:
         
     def save_state(self, ofile):
         CPU.yaml_init()
+        # clean self referential symbols:
+        for s in Symbol.table:
+            del s.symbols
         with open(ofile+".yaml", "w") as f:
             f.write(yaml.dump(self))
         with open(ofile+".pickle", "wb") as f:
@@ -499,72 +536,62 @@ class CPU:
         else:
             raise ValueError("Not a valid memory adress: "+ref)
 
-    def op_movl(self, fro, to):
-        """TODO: This might be invalid semantics, memory in fro allowed?
-        """
-        nsf,val = self._eval_reference(fro)
-        nst,index = self._eval_reference(to)
-        nst[index] = nsf[val]
+    @Operands(RegOp|MemOp|ImmOp, RegOp|MemOp)
+    def op_movl(self, a, b):
+        "TODO: This might have different sizing semantics?"
+        b.value = a.value
 
-    def op_xor(self, fro, to):
-        f = self._eval_operand(fro)
-        reg,t = self._eval_reference(to)
-        reg[t] = reg[t]^f
+    @Operands(RegOp|ImmOp, RegOp)
+    def op_xor(self, a, b):
+        b.value = b.value^a.value
 
-    def op_mov(self, fro, to):
-        nsf,f = self._eval_reference(fro)
-        nst,t = self._eval_reference(to)
-        nst[t] = nsf[f]
+    @Operands(MemOp|RegOp|ImmOp, MemOp|RegOp)
+    def op_mov(self, a, b):
+        b.value = a.value
         
+    @Operands(RegOp|ImmOp, RegOp)
     def op_shl(self, a, b):
-        a = self._eval_operand(a)
-        nsb,b = self._eval_reference(b)
-        nsb[b] = nsb[b]<<a
+        b.value = b.value<<a.value
 
+    @Operands(RegOp|ImmOp, RegOp)
     def op_shr(self, a, b):
-        a = self._eval_operand(a)
-        nsb,b = self._eval_reference(b)
-        nsb[b] = nsb[b]>>a
+        b.value = b.value>>a.value
 
+    @Operands(RegOp|ImmOp, RegOp)
     def op_or(self, a, b):
-        a = self._eval_operand(a)
-        nsb,b = self._eval_reference(b)
-        nsb[b] = nsb[b] | a
+        b.value = a.value|b.value
 
+    @Operands(RegOp|ImmOp, RegOp)
     def op_and(self, a, b):
-        a = self._eval_operand(a)
-        nsb,b = self._eval_reference(b)
-        nsb[b] = nsb[b] & a
+        b.value = a.value&b.value
 
+    @Operands(MemOp, RegOp)
     def op_lea(self, a, b):
-        mem,a = self._eval_reference(a)
-        reg,b = self._eval_reference(b)
-        reg[b] = a
+        b.value = a.key
 
     @Operands(RegOp|ImmOp, RegOp)
     def op_add(self, a, b):
         b.value = b.value + a.value
         
+    @Operands(RegOp|ImmOp, RegOp)
     def op_sub(self, a, b):
-        a = self._eval_operand(a)
-        nsb,b = self._eval_reference(b)
-        nsb[b] = nsb[b] - a
+        b.value = b.value - a.value
 
+    @Operands(RegOp|ImmOp, RegOp|ImmOp)
     def op_cmp(self, a, b):
-        a = self._eval_operand(a)
-        b = self._eval_operand(b)
-        
+        a = a.value
+        b = b.value
         self.flags["SF"] = None # MSB of a-b (sign flag)
         self.flags["ZF"] = ((a-b)==int_(0))      # (zero flag)
         self.flags["CF"] = int_(0)               # (carry flag)
         # flags OF                               # (overflow flag)
         # flags PF                               # (parity flag)
 
+    @Operands(MemOp|RegOp|ImmOp, MemOp|RegOp|ImmOp)
     def op_cmpl(self, a, b):
-        """TODO: this might have different mem/reg reference semantics!"""
-        a = self._eval_operand(a)
-        nsp,b = self._eval_reference(b)
-        b = nsp[b]
+        "TODO: this might have different sizing semantics"
+        a = a.value
+        b = b.value
         
         self.flags["SF"] = None # MSB of a-b (sign flag)
         self.flags["ZF"] = ((a-b)==int_(0))      # (zero flag)
@@ -573,16 +600,17 @@ class CPU:
         # flags PF                               # (parity flag)
 
 
+    @Operands(LabelOp)
     def op_jne(self, label):
         if isinstance(self.flags["ZF"], Expr):
             raise CPUSymbolicJump(self.flags["ZF"])
         if not self.flags["ZF"]:
-            raise CPUJump(label)
+            raise CPUJump(label.key)
     
+    @Operands(RegOp|ImmOp)
     def op_push(self, a):
-        a = self._eval_operand(a)
         self.register["rsp"] = self.register["rsp"]-8
-        self.memory[self.register["rsp"]] = a
+        self.memory[self.register["rsp"]] = a.value
 
 
 def main(self, infile, resultprefix="state", display="hso", *argv):
