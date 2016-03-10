@@ -90,12 +90,6 @@ class CPUSymbolicJump(Exception):
     pass
         
 
-def parse_int(i):
-    try:
-        return int_(int(i))
-    except ValueError as e:
-        return int_(int(i, 16))
-
 class OpExpr(Expr):
     def __init__(self, op, *args):
         self.op = op
@@ -259,17 +253,6 @@ class Operands:
                              for spec,arg
                              in  zip(self.specs, operands))
             return f(cpu, *operands)
-
-        @wraps(f)
-        def memo_wrapper(cpu, *operands):
-            try:
-                return f(cpu, *self.memo[operands])
-            except KeyError as e:
-                self.memo[operands] = tuple(spec.parse(arg, cpu)
-                                            for spec,arg
-                                            in  zip(self.specs, operands))
-            return f(cpu, *self.memo[operands])
-
         return wrapper
 
 
@@ -297,6 +280,13 @@ class OperandSpec:
         msg = "Could not parse {} according to {}".format(operand, self)
         raise ValueError(msg)
 
+    def _parse_int(self, i):
+        try:
+            return int_(int(i))
+        except ValueError as e:
+            return int_(int(i, 16))
+
+
 class MemOpSpec(OperandSpec):
     def evaluate(self, operand, cpu):
         # disp(base,index,scale)  == [base+index*scale+disp]
@@ -321,10 +311,10 @@ class MemOpSpec(OperandSpec):
             defaults
         )
 
-        disp  = parse_int(fields["disp"])
+        disp  = self._parse_int(fields["disp"])
         base  = RegOp.evaluate(fields["base"], cpu).value
         index = RegOp.evaluate(fields["index"], cpu).value
-        scale = parse_int(fields["scale"])
+        scale = self._parse_int(fields["scale"])
 
         return OperandWrapper(cpu.memory, base+index*scale+disp)
 MemOp = MemOpSpec("MemOp")
@@ -332,9 +322,9 @@ MemOp = MemOpSpec("MemOp")
 class ImmOpSpec(OperandSpec):
     def evaluate(self, operand, cpu):
         if operand.startswith("$"):
-            return OperandWrapper(cpu.immediate, parse_int(operand[1:]), writable=False)
+            return OperandWrapper(cpu.immediate, self._parse_int(operand[1:]), writable=False)
         try:
-            return OperandWrapper(cpu.immediate, parse_int(operand), writable=False)
+            return OperandWrapper(cpu.immediate, self._parse_int(operand), writable=False)
         except ValueError as e:
             raise ValueError("Not a valid immediate: "+operand)
 ImmOp = ImmOpSpec("ImmOp")
@@ -484,57 +474,6 @@ class CPU:
         else:
             with open(ifile) as f:
                 return yaml.load(f.read())
-
-
-
-    def _eval_operand(self, op):
-        if op.startswith("%"):
-            return self.register[op[1:]]
-        elif op.startswith("$"):
-            return int_(int(op[1:], 16))
-        elif op.startswith("0x"):
-            return int_(int(op, 16))
-        else:
-            try:
-                return int_(op)
-            except ValueError as e:
-                raise NotImplementedError("wtf operand? "+op)
-
-    def _eval_reference(self, op):
-        if op.startswith("%"):
-            return (self.register, op[1:])
-        elif op.startswith("$"):
-            return (self.immediate, int_(int(op[1:], 16)))
-        else:
-            return (self.memory, self._parse_mem_ref(op))
-
-    def _parse_mem_ref(self, ref):
-        # disp(base,index,scale)  == [base+index*scale+disp]
-        m = re.match(r"""(?P<disp>-?0x[0-9a-fA-F]+)?
-                        \(
-                        (?P<base>%[a-z0-9]+)
-                        (?:,(?P<index>%[a-z0-9]+))?
-                        (?:,(?P<scale>(?:0x)?[0-9a-fA-F]+))?
-                        \)""", ref, re.VERBOSE)
-        if m:
-            fields = [("disp", "0x0"),
-                        ("base", "%zero"),
-                        ("index", "%zero"),
-                        ("scale", "0x0")]
-            vals = []
-            for name,default in fields:
-                match = m.groupdict()[name]
-                if match is None:
-                    print("defaulting: {} = {}".format(name,default))
-                    match = default
-                else:
-                    print("given: {} = {}".format(name, match))
-                vals.append(self._eval_operand(match))
-            disp,base,index,scale = vals
-
-            return base+index*scale+disp
-        else:
-            raise ValueError("Not a valid memory adress: "+ref)
 
     @Operands(RegOp|MemOp|ImmOp, RegOp|MemOp)
     def op_movl(self, a, b):
