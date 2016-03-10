@@ -84,6 +84,23 @@ class Expr:
 
     def __eq__(self, other):
         return OpExpr("eq", self, other)
+
+    def __iter__(self):
+        """
+        Traverse all unique child nodes in breadth-first order
+        """
+        visited = set()
+        queue = deque()
+        queue.append(e)
+        try:
+            for e in iter(queue.pop, None):
+                if e not in visited:
+                    yield e
+                    visited.add(e)
+                    if isinstance(e, OpExpr):
+                        queue.extend(e.args)
+        except IndexError as e:
+            pass
     
 class CPUJump(Exception):
     pass
