@@ -1,11 +1,13 @@
 from pprint import pprint,pformat
 import re
 from numpy import int_, bool_
-from collections import defaultdict,ChainMap
+from collections import defaultdict,ChainMap,OrderedDict,deque
 from functools import wraps
+from itertools import count
 import json
 import pickle
 import yaml
+import hashlib
 
 def read_asm(f):
     """
@@ -174,13 +176,18 @@ class Symbol(Expr):
         return super().__eq__(other)
 
 
-class SymbolicDefaultDict(defaultdict):
+class SymbolicDefaultDict(OrderedDict):
     def __init__(self, prefix=""):
+        super().__init__()
         self.prefix = str(prefix)
-    def __missing__(self, key):
-        val = Symbol(self.prefix+str(key))
-        self[key] = val
-        return val
+
+    def __getitem__(self, key):
+        try:
+            return super().__getitem__(key)
+        except KeyError as e:
+            s = Symbol(self.prefix+str(key))
+            self[key] = s
+            return s
 
 class NameSpaceImmediate:
     def __getitem__(self, key):
@@ -225,7 +232,9 @@ class x86RegisterFile:
             self.regs[key[:-1]] = value & 0xFFFFFFFF
         else:
             raise KeyError("What register are you looking for!? "+str(key))
-            
+
+    def __iter__(self):
+        return iter(sorted(self.regs.items()))
 
     def __repr__(self):
         ret = "Register File:\n"
@@ -437,6 +446,7 @@ class CPU:
         for spec in output:
             output_specifier[spec]()
         print("-- sim paused --")
+        print("State hash: ", self.hash_state())
     
     @classmethod
     def yaml_init(cls):
@@ -464,6 +474,58 @@ class CPU:
             f.write(yaml.dump(self))
         with open(ofile+".pickle", "wb") as f:
             pickle.dump(self, f)
+
+    def unique_exprs(self):
+        """
+        Traverses the whole machine state (reg,mem,flags) and returns a dict
+        which assigns an id to every unique expression
+
+        These ids are stable => same asm-program results in same AST and same ids
+        This is because registers are sorted by name, while memory and flags keep
+        their values in insertion order (OrderedDict).
+        """
+        exprs = OrderedDict()
+        ids = count()
+
+        def traverse(e):
+            queue = deque()
+            queue.append(e)
+            try:
+                for e in iter(queue.pop, None):
+                    if e not in exprs:
+                        exprs[e] = next(ids)
+                        if isinstance(e, OpExpr):
+                            queue.extend(e.args)
+            except IndexError as e:
+                pass
+
+        for flag,expr in self.flags.items():
+            traverse(expr)
+        for reg,expr in self.register:
+            traverse(expr)
+        for addr,expr in self.memory.items():
+            traverse(expr)
+
+        return exprs
+
+    def hash_state(self):
+        """
+        Computes a hash based on the state of the virtual cpu
+
+        depends on the ordered semantics of self.unique_exprs() !
+        """
+        h = hashlib.sha1()
+        exprs = self.unique_exprs() # type: OrderedDict
+        for e,i in exprs.items():
+            if isinstance(e, OpExpr):
+                args = ",".join(str(exprs[a]) for a in e.args)
+            elif isinstance(e, Symbol):
+                args = e.name
+            else:
+                args = str(e)
+            h.update("({}->{})".format(i, args).encode())
+        return h.hexdigest()
+            
 
     @classmethod
     def load_state(cls, ifile):
@@ -561,6 +623,7 @@ def main(self, infile, resultprefix="state", display="hso", *argv):
 
     cpu.run(output=display)
     cpu.save_state(resultprefix)
+    return cpu
 
 if __name__=='__main__':
     import sys
