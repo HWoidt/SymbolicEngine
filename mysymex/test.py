@@ -19,10 +19,12 @@ class TestAssembly(unittest.TestCase):
         """
         do test
         """
-        symrun.main("<self>", "./test/test_unholy.asm", self.ofile_prefix)
+        symrun.main("<self>", "./test/test_unholy.asm", self.ofile_prefix, "ho")
 
         self.assertTrue(os.path.isfile(self.ofile_prefix+".pickle"))
         self.assertTrue(os.path.isfile(self.ofile_prefix+".yaml"))
+
+        restoredCPU = symrun.CPU.load_state(self.ofile_prefix+".pickle")
 
     def tearDown(self):
         """
